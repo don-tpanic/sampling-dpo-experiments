@@ -181,7 +181,6 @@ def compute_perplexities_n_selfcertainties(
 
         # Compute perplexities
         perplexities = torch.exp(-true_log_probs)  # (bsz,)
-        print(f"Perplexities shape: {perplexities.shape}")
         assert perplexities.shape[0] == gen_ids.shape[0], "Perplexities shape does not match gen_ids batch size"
 
         # Compute self-certainty
@@ -196,69 +195,3 @@ def compute_perplexities_n_selfcertainties(
         assert self_certainty.shape[0] == gen_ids.shape[0], "Self-certainty shape does not match gen_ids batch size"
 
     return perplexities.tolist(), self_certainty.tolist()
-    
-
-# def compute_perplexities_n_selfcertainties(
-#         model: torch.nn.Module,
-#         tokenizer: AutoTokenizer,
-#         input_ids: torch.Tensor
-#     ) -> Tuple[List, List]:
-#     """
-#     Compute perplexities and self-certainties for a batch of input_ids using the provided model.
-#     Returns a list of perplexities and self-certainties for each sample in the batch.
-#     Padding tokens are ignored in the calculations.
-
-#     Args:
-#         model (torch.nn.Module): The language model to evaluate.
-#         tokenizer (AutoTokenizer): The tokenizer used to process the input_ids.
-#         input_ids (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing
-#                                   the input token IDs.
-        
-#     Returns:
-#         tuple: A tuple containing two lists:
-#             - perplexities: A list of perplexity values for each sample in the batch.
-#             - self_certainty: A list of self-certainty values for each sample in the batch.
-#     """
-#     with torch.no_grad():
-#         model.eval()
-#         outputs = model(input_ids=input_ids)
-    
-#     logits = outputs.logits
-#     labels = input_ids
-
-#     shift_logits = logits[..., :-1, :].contiguous()  # (bsz, seq_length-1, vocab_size)
-#     shift_labels = labels[..., 1:].contiguous()      # (bsz, seq_length-1)
-
-#     # Compute per sample in a batch
-#     batch_size, seq_length, vocab_size = shift_logits.size()
-
-#     # Create a mask to ignore padding tokens
-#     mask = (shift_labels != tokenizer.pad_token_id).float()  # (bsz, seq_length-1)
-
-#     shift_logits = shift_logits.view(batch_size, -1, vocab_size)  # (bsz, seq_length-1, vocab_size)
-#     shift_labels = shift_labels.view(batch_size, -1)  # (bsz, seq_length-1)
-#     log_probs = F.log_softmax(shift_logits, dim=-1)  # (bsz, seq_length-1, vocab_size)
-#     true_log_probs = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)  # (bsz, seq_length-1)
-
-#     # Apply mask to ignore padding tokens
-#     true_log_probs = true_log_probs * mask
-#     # Average over non-padding tokens
-#     true_log_probs = true_log_probs.sum(dim=-1) / mask.sum(dim=-1)
-
-#     # Compute perplexities
-#     perplexities = torch.exp(-true_log_probs)  # (bsz,)
-#     assert perplexities.shape[0] == input_ids.shape[0], "Perplexities shape does not match input_ids batch size"
-
-#     # Compute self-certainty
-#     uniform_probs = F.softmax(torch.ones_like(shift_logits) / vocab_size, dim=-1)  # Uniform distribution over vocab
-#     kl = F.kl_div(log_probs, uniform_probs, reduction='none')  # (bsz, seq_length-1, vocab_size)
-#     # Token-level kl is the sum across vocab size for each token
-#     kl = kl.sum(dim=-1)  # (bsz, seq_length-1)
-#     # Apply mask to ignore padding tokens
-#     kl = kl * mask
-#     # Self-certainty is the average KL over tokens in a sequence
-#     self_certainty = kl.sum(dim=-1) / mask.sum(dim=-1)  # (bsz,)
-#     assert self_certainty.shape[0] == input_ids.shape[0], "Self-certainty shape does not match input_ids batch size"
-
-#     return perplexities.tolist(), self_certainty.tolist()
-
