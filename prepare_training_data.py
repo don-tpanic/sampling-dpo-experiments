@@ -1,3 +1,4 @@
+import os
 import torch
 import datasets
 import tqdm
@@ -8,7 +9,7 @@ import utils
 Prepare data for DPO training.
 """
 
-def generate_trainset_ids_n_metrics(
+def generate_trainset_answers_n_metrics(
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         dataset: datasets.Dataset,
@@ -16,10 +17,10 @@ def generate_trainset_ids_n_metrics(
         batch_size: int = 8,
     ) -> dict:
     """
-    Run through the dataset and convert the ground truth answers to gen_ids,
-    and compare the logprobs and self-certainties of the ground truth answers.
+    Run through the dataset and save the ground truth answers,
+    and compute the logprobs and self-certainties of the ground truth answers.
 
-    This function is needed because, we require gen_ids and metrics when during
+    This function is needed because, we require answers and metrics when during
     synthetic data generation, there might be questions the model never answered
     correctly.
     """
@@ -28,7 +29,7 @@ def generate_trainset_ids_n_metrics(
 
     # Randomly sample `num_questions` questions from the dataset
     questions, answers, n_shot_examples = utils.generate_n_shot_examples(
-        questions, answers, num_examples=num_questions
+        questions, answers, num_examples=num_examples
     )
 
     # Prepare all (question_idx, sample_idx) pairs
@@ -37,12 +38,15 @@ def generate_trainset_ids_n_metrics(
 
     all_logprobs = {}
     all_selfcertainties = {}
-    all_gen_ids = {}
+    all_answers = {}
 
-    for batch_start in tqdm.tqdm(range(0, num_questions, batch_size), desc="Generating trainset ids and metrics"):
+    for batch_start in tqdm.tqdm(range(0, num_questions, batch_size), desc="Generating trainset answers and metrics"):
         batch_end = min(batch_start + batch_size, num_questions)
         batch_questions = questions[batch_start:batch_end]
         batch_answers = answers[batch_start:batch_end]
+
+        print(f"num_questions: {num_questions}, batch_size: {batch_size}")
+        print(f"Processing batch {batch_start} to {batch_end}...")
 
         # Prepare batch inputs - PROMPT ONLY (without answers)
         batch_chats_prompt_only = []
@@ -98,6 +102,8 @@ def generate_trainset_ids_n_metrics(
         answer_lengths = [len(full_tokens[i]) - answer_start_positions[i] for i in range(len(full_tokens))]
 
         # Tokenize batch
+        # Use right padding for inference
+        tokenizer.padding_side = "right"
         batch_inputs = tokenizer(
             formatted_chats_full,
             return_tensors="pt",
@@ -106,6 +112,7 @@ def generate_trainset_ids_n_metrics(
         ).to("cuda")
         input_ids = batch_inputs.input_ids
         attention_mask = batch_inputs.attention_mask
+        print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
 
         # Forward pass through the whole batch
         # in order to compute logprobs and self-certainties
@@ -121,27 +128,32 @@ def generate_trainset_ids_n_metrics(
         )
 
         # Store results in dictionaries
-        for i in range(batch_size):
+        actual_batch_size = batch_end - batch_start
+        for i in range(actual_batch_size):
             q_idx = batch_start + i
             if q_idx not in all_logprobs:
                 all_logprobs[q_idx] = []
                 all_selfcertainties[q_idx] = []
-                all_gen_ids[q_idx] = []
-
-            # Get the generated tokens (answer part)
-            gen_ids = input_ids[i, answer_start_positions[i]:]
-            all_gen_ids[q_idx].append(gen_ids)
+                all_answers[q_idx] = []
 
             # Store logprobs and self-certainties
             all_logprobs[q_idx].append(logprobs[i])
             all_selfcertainties[q_idx].append(selfcertainties[i])
+            all_answers[q_idx].append(batch_answers[i])
+
+        del input_ids, attention_mask
+        torch.cuda.empty_cache()
 
     results = {
         "logprobs": all_logprobs,
         "selfcertainties": all_selfcertainties,
-        "gen_ids": all_gen_ids,
+        "answers": all_answers,
     }
-    torch.save(results, "trainset_ids_n_metrics.pt")
+    torch.save(
+        results, 
+        f"data/trainset_answers_n_metrics_"\
+        f"bsz{batch_size}_q{num_questions}.pt"
+    )
 
 
 def generate_synthetic_data(
@@ -182,8 +194,6 @@ def generate_synthetic_data(
     all_correctness = {}
     all_logprobs = {}
     all_selfcertainties = {}
-    all_input_ids = {}
-    all_gen_ids = {}
 
     for batch_start in tqdm.tqdm(range(0, total_pairs, batch_size), desc="Generating synthetic data"):
         batch_end = min(batch_start + batch_size, total_pairs)
@@ -210,6 +220,8 @@ def generate_synthetic_data(
         ]
 
         # Tokenize batch
+        # Use left padding for generation
+        tokenizer.padding_side = "left"
         batch_inputs = tokenizer(
             formatted_chats,
             return_tensors="pt",
@@ -262,60 +274,47 @@ def generate_synthetic_data(
                 all_correctness[q_idx] = []
                 all_logprobs[q_idx] = []
                 all_selfcertainties[q_idx] = []
-                all_input_ids[q_idx] = []
-                all_gen_ids[q_idx] = []
 
             all_solutions[q_idx].append(ans_pred)
             all_correctness[q_idx].append(utils.is_correct_solution(ans_pred, answers[q_idx]))
             all_logprobs[q_idx].append(logprobs[i])
             all_selfcertainties[q_idx].append(selfcertainties[i])
-            all_input_ids[q_idx].append(input_ids[i])
-            all_gen_ids[q_idx].append(gen_ids[i])
 
         del input_ids, output_ids, attention_mask
         torch.cuda.empty_cache()
     
     results = {
+        "questions": questions,
         "solutions": all_solutions,
         "correctness_mask": all_correctness,
         "logprobs": all_logprobs,
         "selfcertainties": all_selfcertainties,
-        "input_ids": all_input_ids,
-        "gen_ids": all_gen_ids,
     }
+    torch.save(
+        results, 
+        f"data/synthetic_data_"\
+        f"temp{temperature}_bsz{batch_size}_shot{num_examples}_q{num_questions}.pt"
+    )
 
-    torch.save(results, "synthetic_data.pt")
 
-
-def prepare_training_data(
-        tokenizer: AutoTokenizer,
-        model: AutoModelForCausalLM,
-        synthetic_data: dict
-    ):
+def prepare_training_data(synthetic_data: dict) -> None:
     """
     Based on the generated synthetic data, prepare training data for model training.
 
     synthetic_data = {
+        "questions": list of questions,
         "solutions": all_solutions,
         "correctness_mask": all_correctness,
         "logprobs": all_logprobs,
         "selfcertainties": all_selfcertainties,
-        "questions": questions,
-        "answers": answers,
-        "input_ids": all_input_ids,
-        "gen_ids": all_gen_ids,
     }
     
     where
+        questions: list of question texts
         solutions: dict of {question_idx: [solution1, solution2, ...]}
         correctness_mask: dict of {question_idx: [True/False, True/False, ...]}
         logprobs: dict of {question_idx: [logprob1, logprob2, ...]}
         selfcertainties: dict of {question_idx: [selfcertainty1, selfcertainty2, ...]}
-        questions: list of questions
-        answers: list of answers
-        n_shot_examples: list of n-shot examples
-        input_ids: dict of {question_idx: [input_ids1, input_ids2, ...]}
-        gen_ids: dict of {question_idx: [gen_ids1, gen_ids2, ...]}
     
     For each question,
         If solutions all correct, chosen is the one with highest selfcertainty,
@@ -326,18 +325,24 @@ def prepare_training_data(
                                 reject is the incorrect one with highest selfcertainty.
 
     To compile the training data, for each question, we collect the following:
-        - input_ids: the input_ids for the question
-        - chosen_ids: the gen_ids of the chosen solution
-        - reject_ids: the gen_ids of the rejected solution
+        - questions: the question text
+        - chosen_solutions: the solution text of the chosen solution
+        - reject_solutions: the solution text of the rejected solution
         - chosen_logprobs: the logprobs of the chosen solution
         - reject_logprobs: the logprobs of the rejected solution
         - chosen_selfcertainties: the self-certainties of the chosen solution
         - reject_selfcertainties: the self-certainties of the rejected solution
     """
+    # Load trainset_answers_n_metrics
+    # We only need this when a question was never answered correctly
+    # during synthetic data generation, so we can use the ground truth answer
+    # as the chosen solution and use the answer's logprobs and self-certainties
+    trainset_answers_n_metrics = torch.load("trainset_answers_n_metrics.pt")
+
     prepared_data = {
-        "input_ids": [],
-        "chosen_ids": [],
-        "reject_ids": [],
+        "questions": [],
+        "chosen_solutions": [],
+        "reject_solutions": [],
         "chosen_logprobs": [],
         "reject_logprobs": [],
         "chosen_selfcertainties": [],
@@ -349,20 +354,32 @@ def prepare_training_data(
         correctness_mask = synthetic_data['correctness_mask'][q_idx]
         logprobs = synthetic_data['logprobs'][q_idx]
         selfcertainties = synthetic_data['selfcertainties'][q_idx]
-        input_ids = synthetic_data['input_ids'][q_idx]
-        gen_ids = synthetic_data['gen_ids'][q_idx]
 
         # Determine chosen and reject solutions based on correctness
         if all(correctness_mask):
+            print(f"All solutions correct for question {q_idx}.")
             # All correct
             chosen_idx = selfcertainties.index(max(selfcertainties))
             reject_idx = selfcertainties.index(min(selfcertainties))
+            chosen_solution = solutions[chosen_idx]
+            chosen_logprobs = logprobs[chosen_idx]
+            chosen_selfcertainties = selfcertainties[chosen_idx]
+            reject_solution = solutions[reject_idx]
+            reject_logprobs = logprobs[reject_idx]
+            reject_selfcertainties = selfcertainties[reject_idx]
+
         elif not any(correctness_mask):
+            print(f"All solutions incorrect for question {q_idx}.")
             # All incorrect
-            chosen_idx = 0  # Original answer
             reject_idx = selfcertainties.index(max(selfcertainties))
-            # TODO: here needs to read off from the original answer
+            chosen_solution = trainset_answers_n_metrics['answers'][q_idx][0]  # Use the ground truth answer
+            chosen_logprobs = trainset_answers_n_metrics['logprobs'][q_idx][0]  # Use the ground truth logprobs
+            chosen_selfcertainties = trainset_answers_n_metrics['selfcertainties'][q_idx][0]  # Use the ground truth self-certainty
+            reject_logprobs = logprobs[reject_idx]
+            reject_selfcertainties = selfcertainties[reject_idx]
+            reject_solution = solutions[reject_idx]
         else:
+            print(f"Mixed correctness for question {q_idx}.")
             # Mixed correctness
             correct_indices = [i for i, correct in enumerate(correctness_mask) if correct]
             incorrect_indices = [i for i, correct in enumerate(correctness_mask) if not correct]
@@ -372,18 +389,33 @@ def prepare_training_data(
             
             chosen_idx = max(correct_indices, key=lambda i: selfcertainties[i])
             reject_idx = max(incorrect_indices, key=lambda i: selfcertainties[i])
-        
+            chosen_solution = solutions[chosen_idx]
+            chosen_logprobs = logprobs[chosen_idx]
+            chosen_selfcertainties = selfcertainties[chosen_idx]
+            reject_solution = solutions[reject_idx]
+            reject_logprobs = logprobs[reject_idx]
+            reject_selfcertainties = selfcertainties[reject_idx]
+
         # Collect data for the chosen and rejected solutions
-        prepared_data["input_ids"].append(input_ids)
-        prepared_data["chosen_ids"].append(gen_ids[chosen_idx])
-        prepared_data["reject_ids"].append(gen_ids[reject_idx])
-        prepared_data["chosen_logprobs"].append(logprobs[chosen_idx])
-        prepared_data["reject_logprobs"].append(logprobs[reject_idx])
-        prepared_data["chosen_selfcertainties"].append(selfcertainties[chosen_idx])
-        prepared_data["reject_selfcertainties"].append(selfcertainties[reject_idx])
+        prepared_data["questions"].append(synthetic_data['questions'][q_idx])
+        prepared_data["chosen_solutions"].append(chosen_solution)
+        prepared_data["reject_solutions"].append(reject_solution)
+        prepared_data["chosen_logprobs"].append(chosen_logprobs)
+        prepared_data["reject_logprobs"].append(reject_logprobs)
+        prepared_data["chosen_selfcertainties"].append(chosen_selfcertainties)
+        prepared_data["reject_selfcertainties"].append(reject_selfcertainties)
+    
+    # Save the prepared data
+    torch.save(
+        prepared_data, 
+        f"data/prepared_training_data_"\
+        f"temp{temperature}_bsz{batch_size}_shot{num_examples}_q{num_questions}.pt"
+    )
 
 
 if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
     model = AutoModelForCausalLM.from_pretrained(
         "microsoft/Phi-3.5-mini-instruct",
         device_map="cuda",
@@ -404,25 +436,43 @@ if __name__ == "__main__":
         # Question:
         {question}
     """
+    num_questions = 50
+    num_samples_per_question = 10
+    num_examples = 2
+    batch_size = 8
+    temperature = 1.5
+    max_new_tokens = 256
+    print("Settings:")
+    print(f"num_questions: {num_questions}, num_samples_per_question: {num_samples_per_question}, " \
+          f"num_examples: {num_examples}, batch_size: {batch_size}, " \
+          f"temperature: {temperature}, max_new_tokens: {max_new_tokens}")  
 
     # Generate trainset ids and metrics
-    trainset_ids_n_metrics = generate_trainset_ids_n_metrics(
+    trainset_ids_n_metrics = generate_trainset_answers_n_metrics(
         model=model,
         tokenizer=tokenizer,
         dataset=ds['train'],
-        num_questions=8,
-        batch_size=8,
+        num_questions=num_questions,
+        batch_size=batch_size,
     )
 
-    # # Generate synthetic data
-    # synthetic_data = generate_synthetic_data(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     dataset=ds['train'],
-    #     num_samples_per_question=2,
-    #     num_questions=10,
-    #     temperature=0.7,
-    #     max_new_tokens=256,
-    #     num_examples=8,
-    #     batch_size=8,
-    # )
+    # Generate synthetic data
+    synthetic_data = generate_synthetic_data(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=ds['train'],
+        num_samples_per_question=num_samples_per_question,
+        num_questions=num_questions,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        num_examples=num_examples,
+        batch_size=batch_size,
+    )
+
+    # Prepare training data
+    prepare_training_data(
+        synthetic_data=torch.load(
+            f"data/synthetic_data_temp{temperature}_"\
+            f"bsz{batch_size}_shot{num_examples}_q{num_questions}.pt"
+        )
+    )
