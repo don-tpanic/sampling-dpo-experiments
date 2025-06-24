@@ -139,15 +139,15 @@ def evaluate_model(
     return sum(all_scores) / len(all_scores)
 
 
-def compute_perplexities_n_selfcertainties(
+def compute_logprobs_n_selfcertainties(
         logits: torch.Tensor,
         gen_ids: torch.Tensor,
         tokenizer: AutoTokenizer,
     ) -> Tuple[List, List]:
     """
-    Compute perplexities and self-certainties for ONLY generated tokens.
+    Compute log probabilities and self-certainties for ONLY generated tokens.
 
-    Returns a list of perplexities and self-certainties for each sample in the batch.
+    Returns a list of log probabilities and self-certainties for each sample in the batch.
     Padding tokens are ignored in the calculations.
 
     Args:
@@ -159,7 +159,7 @@ def compute_perplexities_n_selfcertainties(
         
     Returns:
         tuple: A tuple containing two lists:
-            - perplexities: A list of perplexity values for each sample in the batch.
+            - log_probs: A list of log probability values for each sample in the batch.
             - self_certainty: A list of self-certainty values for each sample in the batch.
     """
     with torch.no_grad():
@@ -178,10 +178,7 @@ def compute_perplexities_n_selfcertainties(
         true_log_probs = true_log_probs * mask
         # Average over non-padding tokens
         true_log_probs = true_log_probs.sum(dim=-1) / mask.sum(dim=-1)
-
-        # Compute perplexities
-        perplexities = torch.exp(-true_log_probs)  # (bsz,)
-        assert perplexities.shape[0] == gen_ids.shape[0], "Perplexities shape does not match gen_ids batch size"
+        assert true_log_probs.shape[0] == gen_ids.shape[0], "Log probabilities shape does not match gen_ids batch size"
 
         # Compute self-certainty
         uniform_probs = F.softmax(torch.ones_like(logits) / vocab_size, dim=-1)
@@ -194,4 +191,90 @@ def compute_perplexities_n_selfcertainties(
         self_certainty = kl.sum(dim=-1) / mask.sum(dim=-1)
         assert self_certainty.shape[0] == gen_ids.shape[0], "Self-certainty shape does not match gen_ids batch size"
 
-    return perplexities.tolist(), self_certainty.tolist()
+    return true_log_probs.tolist(), self_certainty.tolist()
+
+
+def forward_pass_compute_logprobs_n_selfcertainties(
+        model: AutoModelForCausalLM,
+        tokenizer: AutoTokenizer,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        answer_start_positions: list,
+        answer_lengths: list,
+    ) -> Tuple[List, List]:
+    """
+    Compute log probabilities and self-certainties for ONLY the answer tokens.
+
+    Returns a list of log probabilities and self-certainties for each sample in the batch.
+    Padding tokens are ignored in the calculations.
+
+    Args:
+        model (AutoModelForCausalLM): The model to compute logits from.
+        tokenizer (AutoTokenizer): The tokenizer used to process the input_ids.
+        input_ids (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing
+                                  the input token IDs which are question+answer.
+        attention_mask (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing
+                                       the attention mask for the input_ids.
+        answer_start_positions (list): A list of integers indicating the start positions of the answers
+                                       in the input_ids for each sample in the batch.
+        answer_lengths (list): A list of integers indicating the lengths of the answers in the input_ids
+                               for each sample in the batch.
+        
+    Returns:
+        tuple: A tuple containing two lists:
+            - log_probs: A list of log probability values for each sample in the batch.
+            - self_certainty: A list of self-certainty values for each sample in the batch.
+    """
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask
+        )
+        logits = outputs.logits
+
+    # Create labels by shifting input_ids (standard next-token prediction)
+    labels = input_ids[:, 1:].contiguous()  # (bsz, seq_len - 1)
+    logits = logits[:, :-1, :].contiguous()  # (bsz, seq_len - 1, vocab_size)
+    
+    batch_size, seq_len, vocab_size = logits.shape
+    
+    # Create comprehensive mask: ignore prompt tokens AND padding tokens
+    mask = torch.zeros_like(labels, dtype=torch.float)  # (bsz, seq_len)
+    
+    for i in range(batch_size):
+        answer_start = answer_start_positions[i]
+        answer_length = answer_lengths[i]
+        
+        # Only mask answer tokens (from answer_start to answer_start + answer_length - 1)
+        # Note: we subtract 1 because labels is shifted by 1 position
+        answer_end = min(answer_start + answer_length - 1, seq_len)
+        if answer_start < seq_len:
+            mask[i, answer_start:answer_end] = 1.0
+    
+    # Also mask out padding tokens
+    mask = mask * (labels != tokenizer.pad_token_id).float()
+    
+    # Reshape for batch computation
+    logits = logits.view(batch_size, seq_len, vocab_size)
+    labels = labels.view(batch_size, seq_len)
+    
+    # Compute log probabilities
+    log_probs = F.log_softmax(logits, dim=-1)
+    true_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # (bsz, seq_len)
+    
+    # Apply mask to ignore prompt and padding tokens
+    true_log_probs = true_log_probs * mask
+    
+    # Average over non-masked tokens
+    true_log_probs = true_log_probs.sum(dim=-1) / mask.sum(dim=-1)
+    assert true_log_probs.shape[0] == input_ids.shape[0], "Log probabilities shape does not match input_ids batch size"
+
+    # Compute self-certainty
+    uniform_probs = F.softmax(torch.ones_like(logits) / vocab_size, dim=-1)
+    kl = F.kl_div(log_probs, uniform_probs, reduction='none')  # (bsz, seq_len, vocab_size)
+    kl = kl.sum(dim=-1)  # (bsz, seq_len)
+    kl = kl * mask  # Apply mask to ignore prompt and padding tokens
+    self_certainty = kl.sum(dim=-1) / mask.sum(dim=-1)
+    assert self_certainty.shape[0] == input_ids.shape[0], "Self-certainty shape does not match input_ids batch size"
+
+    return true_log_probs.tolist(), self_certainty.tolist()
