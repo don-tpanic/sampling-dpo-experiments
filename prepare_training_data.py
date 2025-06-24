@@ -112,7 +112,6 @@ def generate_trainset_answers_n_metrics(
         ).to("cuda")
         input_ids = batch_inputs.input_ids
         attention_mask = batch_inputs.attention_mask
-        print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
 
         # Forward pass through the whole batch
         # in order to compute logprobs and self-certainties
@@ -152,7 +151,7 @@ def generate_trainset_answers_n_metrics(
     torch.save(
         results, 
         f"data/trainset_answers_n_metrics_"\
-        f"bsz{batch_size}_q{num_questions}.pt"
+        f"bsz{batch_size}_shot{num_examples}_q{num_questions}.pt"
     )
 
 
@@ -337,7 +336,10 @@ def prepare_training_data(synthetic_data: dict) -> None:
     # We only need this when a question was never answered correctly
     # during synthetic data generation, so we can use the ground truth answer
     # as the chosen solution and use the answer's logprobs and self-certainties
-    trainset_answers_n_metrics = torch.load("trainset_answers_n_metrics.pt")
+    trainset_answers_n_metrics = torch.load(
+        "data/trainset_answers_n_metrics_"\
+        f"bsz{batch_size}_shot{num_examples}_q{num_questions}.pt"
+    )
 
     prepared_data = {
         "questions": [],
