@@ -1,12 +1,15 @@
+import argparse
 import os
 from dataclasses import dataclass
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 import torch
+import wandb
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
+import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
 
 """
@@ -15,14 +18,10 @@ Training script for DPO
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-5
-    epochs: int = 2
-    batch_size: int = 4
-    device: str = 'cuda'
-    validation_split: float = 0.1
-    max_absolute_length: int = 2048
-    beta: float = 0.1
-
+    def __init__(self, config_dict):
+        for key, value in config_dict.items():
+            setattr(self, key, value)
+    
 
 def create_train_val_split(dataset: Dataset, val_split: float = 0.1) -> Tuple[Dataset, Dataset]:
     """
@@ -225,7 +224,8 @@ def compute_dpo_loss_batch(
         policy_model,
         tokenizer,
         device,
-        beta
+        beta,
+        no_grad,
     ):
     policy_chosen_log_probas, _ = forward_logprobs(
         model=policy_model,
@@ -234,7 +234,7 @@ def compute_dpo_loss_batch(
         attention_mask=batch["chosen_attention_mask"].to(device),
         answer_start_positions=batch["chosen_answer_start"].to(device),
         answer_lengths=batch["chosen_answer_length"].to(device),
-        no_grad=False,
+        no_grad=no_grad,
     )
     policy_rejected_log_probas, _ = forward_logprobs(
         model=policy_model,
@@ -243,7 +243,7 @@ def compute_dpo_loss_batch(
         attention_mask=batch["reject_attention_mask"].to(device),
         answer_start_positions=batch["reject_answer_start"].to(device),
         answer_lengths=batch["reject_answer_length"].to(device),
-        no_grad=False,
+        no_grad=no_grad,
     )
 
     reference_model_log_probas = batch["chosen_logprobs"].to(device)
@@ -268,6 +268,13 @@ def train(
     """
     Main training function for DPO.
     """
+    run_id = wandb.run.id
+    print(f"Run ID: {run_id}")
+
+    model_dir = f"models/{run_id}"
+    os.makedirs(model_dir, exist_ok=True)
+    print(f"Model will be saved to: {model_dir}")
+
     train_dataset, val_dataset = create_train_val_split(dataset, config.validation_split)
     
     print(f"Training on {len(train_dataset)} samples, validating on {len(val_dataset)} samples")
@@ -304,6 +311,8 @@ def train(
         # Training phase
         model.train()
         total_train_loss = 0
+        total_train_chosen_rewards = 0
+        total_train_rejected_rewards = 0
         num_train_batches = 0
         
         for batch_idx, batch in enumerate(train_dataloader):
@@ -315,38 +324,105 @@ def train(
                 policy_model=model,
                 tokenizer=tokenizer,
                 device=config.device,
-                beta=config.beta
+                beta=config.beta,
+                no_grad=False
             )
             
             loss.backward()
-            import code; code.interact(local=locals())  # Debugging breakpoint
             optimizer.step()
             
+            # Accumulate metrics
             total_train_loss += loss.item()
+            total_train_chosen_rewards += chosen_rewards.mean().item()
+            total_train_rejected_rewards += rejected_rewards.mean().item()
             num_train_batches += 1
             
+            # Log metrics every 10 batches
             if batch_idx % 10 == 0:
+                batch_metrics = {
+                    "batch_loss": loss.item(),
+                    "batch_rewards_margin": (chosen_rewards - rejected_rewards).mean().item(),
+                    "epoch": epoch + 1,
+                    "batch": batch_idx,
+                    "global_step": epoch * len(train_dataloader) + batch_idx
+                }
+                wandb.log(batch_metrics)
                 print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
         
         avg_train_loss = total_train_loss / num_train_batches
+        avg_train_chosen_rewards = total_train_chosen_rewards / num_train_batches
+        avg_train_rejected_rewards = total_train_rejected_rewards / num_train_batches
         print(f"  Average training loss: {avg_train_loss:.4f}")
         
         # Validation phase
-        pass # TODO:
-    
+        model.eval()
+        total_val_loss = 0
+        total_val_chosen_rewards = 0
+        total_val_rejected_rewards = 0
+        num_val_batches = 0
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader):
+                loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
+                    batch=batch,
+                    policy_model=model,
+                    tokenizer=tokenizer,
+                    device=config.device,
+                    beta=config.beta,
+                    no_grad=True
+                )
+                
+                total_val_loss += loss.item()
+                total_val_chosen_rewards += chosen_rewards.mean().item()
+                total_val_rejected_rewards += rejected_rewards.mean().item()
+                num_val_batches += 1
+                        
+        avg_val_loss = total_val_loss / num_val_batches
+        avg_val_chosen_rewards = total_val_chosen_rewards / num_val_batches
+        avg_val_rejected_rewards = total_val_rejected_rewards / num_val_batches
+        print(f"  Average validation loss: {avg_val_loss:.4f}")
+
+        # Log epoch metrics
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "avg_train_loss": avg_train_loss,
+            "avg_train_rewards_margin": avg_train_chosen_rewards - avg_train_rejected_rewards,
+            "avg_val_loss": avg_val_loss,
+            "avg_val_rewards_margin": avg_val_chosen_rewards - avg_val_rejected_rewards
+        }
+        wandb.log(epoch_metrics)
+
+        # Save model checkpoint after each epoch
+        model.save_pretrained(f"{model_dir}/checkpoint_epoch_{epoch + 1}")
+
+    # Save final model
+    model.save_pretrained(f"{model_dir}/final_model_checkpoint")
+    tokenizer.save_pretrained(f"{model_dir}/final_model_checkpoint")
+    print("Training complete. Model and tokenizer saved.")
     return model
 
-if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DPO Training Script")
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        default="config_1",
+        help="Config filename"
+    )
+    args = parser.parse_args()
+    
+    # Load config
+    config_dict = utils.load_config(args.config)
+    config = TrainConfig(config_dict)
+    os.environ["CUDA_VISIBLE_DEVICES"] = config.cuda_device
     model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Phi-3.5-mini-instruct",
+        config.model_name,
         device_map="cuda",
         torch_dtype="auto",
         trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3.5-mini-instruct")
-    prepared_training_data = torch.load("data/prepared_training_data_temp1.5_bsz8_shot2_q500.pt")
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    prepared_training_data = torch.load(config.data_path)
     hf_dataset = Dataset.from_dict({
         "questions": prepared_training_data["questions"],
         "chosen_solutions": prepared_training_data["chosen_solutions"],
@@ -356,4 +432,22 @@ if __name__ == "__main__":
         "reject_logprobs": prepared_training_data["reject_logprobs"],
         "reject_selfcertainties": prepared_training_data["reject_selfcertainties"],
     })
-    train(model, tokenizer, hf_dataset, TrainConfig())
+
+    torch.manual_seed(config.random_seed)
+    torch.cuda.manual_seed(config.random_seed)
+
+    wandb.init(
+        project=config.wandb_project,
+        entity=config.wandb_entity,
+        config={
+            "learning_rate": config.lr,
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "device": config.device,
+            "validation_split": config.validation_split,
+            "max_absolute_length": config.max_absolute_length,
+            "beta": config.beta
+        }
+    )
+
+    train(model, tokenizer, hf_dataset, config)

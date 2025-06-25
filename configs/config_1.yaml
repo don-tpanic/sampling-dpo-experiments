@@ -1,0 +1,25 @@
+# DPO Training Configuration
+# configs/config_1.yaml
+
+# Training hyperparameters
+lr: 3.0e-5
+epochs: 2
+batch_size: 4
+beta: 0.1
+
+# Model and data configuration
+max_absolute_length: 2048
+validation_split: 0.1
+model_name: "microsoft/Phi-3.5-mini-instruct"
+data_path: "data/prepared_training_data_temp1.5_bsz8_shot2_q500.pt"
+
+# Device configuration
+device: "cuda"
+cuda_device: "0"
+
+# Wandb configuration
+wandb_project: "dpo-training"
+wandb_entity: "kenotron"
+
+# Random seed
+random_seed: 42

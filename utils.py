@@ -4,6 +4,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import datasets
 import tqdm
 from typing import Tuple, List
+import yaml
+
+
+def load_config(config_name):
+    """
+    Load a YAML configuration file and return the configuration as a dictionary.
+    
+    Args:
+        config_name (str): The name of the configuration file to load.
+        
+    Returns:
+        config_dict: The loaded configuration.
+    """
+    with open(f"configs/{config_name}.yaml", 'r') as f:
+        config_dict = yaml.safe_load(f)
+    return config_dict
 
 
 def generate_n_shot_examples(
