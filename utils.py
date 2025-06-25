@@ -201,6 +201,7 @@ def forward_pass_compute_logprobs_n_selfcertainties(
         attention_mask: torch.Tensor,
         answer_start_positions: list,
         answer_lengths: list,
+        no_grad: bool = True,
     ) -> Tuple[List, List]:
     """
     Compute log probabilities and self-certainties for ONLY the answer tokens.
@@ -219,13 +220,23 @@ def forward_pass_compute_logprobs_n_selfcertainties(
                                        in the input_ids for each sample in the batch.
         answer_lengths (list): A list of integers indicating the lengths of the answers in the input_ids
                                for each sample in the batch.
+        no_grad (bool): If True, disables gradient computation for the forward pass.
         
     Returns:
         tuple: A tuple containing two lists:
             - log_probs: A list of log probability values for each sample in the batch.
             - self_certainty: A list of self-certainty values for each sample in the batch.
     """
-    with torch.no_grad():
+    if no_grad is True:
+        model.eval()
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask
+            )
+            logits = outputs.logits
+    else:
+        model.train()
         outputs = model(
             input_ids=input_ids, 
             attention_mask=attention_mask
@@ -277,4 +288,4 @@ def forward_pass_compute_logprobs_n_selfcertainties(
     self_certainty = kl.sum(dim=-1) / mask.sum(dim=-1)
     assert self_certainty.shape[0] == input_ids.shape[0], "Self-certainty shape does not match input_ids batch size"
 
-    return true_log_probs.tolist(), self_certainty.tolist()
+    return true_log_probs, self_certainty
