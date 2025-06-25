@@ -5,6 +5,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 import torch
 import wandb
+import tqdm
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
@@ -305,7 +306,7 @@ def train(
     model = model.to(config.device)
     
     # Training loop
-    for epoch in range(config.epochs):
+    for epoch in tqdm.tqdm(range(config.epochs), desc="Training"):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
         # Training phase
@@ -314,7 +315,7 @@ def train(
         total_train_chosen_rewards = 0
         total_train_rejected_rewards = 0
         num_train_batches = 0
-        
+
         for batch_idx, batch in enumerate(train_dataloader):
             optimizer.zero_grad()
             
@@ -347,8 +348,8 @@ def train(
                     "global_step": epoch * len(train_dataloader) + batch_idx
                 }
                 wandb.log(batch_metrics)
-                print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
-        
+                print(f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {loss.item():.4f}")
+
         avg_train_loss = total_train_loss / num_train_batches
         avg_train_chosen_rewards = total_train_chosen_rewards / num_train_batches
         avg_train_rejected_rewards = total_train_rejected_rewards / num_train_batches
