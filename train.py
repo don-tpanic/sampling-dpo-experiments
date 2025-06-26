@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
-from peft import LoraConfig, get_peft_model, TaskType
+# from peft import LoraConfig, get_peft_model, TaskType
 import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
 
@@ -265,6 +265,8 @@ def setup_lora_model(model: AutoModelForCausalLM, config: TrainConfig) -> AutoMo
     """
     Setup LoRA configuration and wrap the model if LoRA is enabled.
     """
+    from peft import LoraConfig, get_peft_model, TaskType
+
     if not getattr(config, 'use_lora', False):
         return model
     
@@ -294,7 +296,7 @@ def train(
     run_id = wandb.run.id
     print(f"Run ID: {run_id}")
 
-    model_dir = f"models/{run_id}"
+    model_dir = f"models/{args.config}/{run_id}"
     os.makedirs(model_dir, exist_ok=True)
     print(f"Model will be saved to: {model_dir}")
 
