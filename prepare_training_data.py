@@ -32,6 +32,8 @@ def generate_trainset_answers_n_metrics(
         questions, answers, num_examples=num_examples
     )
 
+    print("[DEBUG] `trainset` n_shot_examples:", n_shot_examples)
+
     # Prepare all (question_idx, sample_idx) pairs
     questions = questions[:num_questions]
     answers = answers[:num_questions]
@@ -40,9 +42,13 @@ def generate_trainset_answers_n_metrics(
     all_selfcertainties = {}
     all_answers = {}
 
-    for batch_start in tqdm.tqdm(range(0, num_questions, batch_size), desc="Generating trainset answers and metrics"):
+    # for batch_start in tqdm.tqdm(range(0, num_questions, batch_size), desc="Generating trainset answers and metrics"):
+    for batch_start in range(0, num_questions, batch_size):
         batch_end = min(batch_start + batch_size, num_questions)
         batch_questions = questions[batch_start:batch_end]
+
+        print(f"[DEBUG] `trainset` batch_questions: {batch_questions}")
+
         batch_answers = answers[batch_start:batch_end]
 
         print(f"num_questions: {num_questions}, batch_size: {batch_size}")
@@ -103,7 +109,7 @@ def generate_trainset_answers_n_metrics(
 
         # Tokenize batch
         # Use right padding for inference
-        tokenizer.padding_side = "right"
+        tokenizer.padding_side = "right"   # DEBUG: sure?
         batch_inputs = tokenizer(
             formatted_chats_full,
             return_tensors="pt",
@@ -125,6 +131,8 @@ def generate_trainset_answers_n_metrics(
             answer_start_positions=answer_start_positions,
             answer_lengths=answer_lengths,
         )
+
+        print(f"[DEBUG] `trainset` logprobs = {logprobs}")
 
         # Store results in dictionaries
         actual_batch_size = batch_end - batch_start
@@ -178,6 +186,8 @@ def generate_synthetic_data(
         questions, answers, num_examples=num_examples
     )
 
+    print("[DEBUG] `generate_synthetic_data` n_shot_examples:", n_shot_examples)
+
     # Prepare all (question_idx, sample_idx) pairs
     questions = questions[:num_questions]
     answers = answers[:num_questions]
@@ -194,7 +204,8 @@ def generate_synthetic_data(
     all_logprobs = {}
     all_selfcertainties = {}
 
-    for batch_start in tqdm.tqdm(range(0, total_pairs, batch_size), desc="Generating synthetic data"):
+    # for batch_start in tqdm.tqdm(range(0, total_pairs, batch_size), desc="Generating synthetic data"):
+    for batch_start in range(0, total_pairs, batch_size):
         batch_end = min(batch_start + batch_size, total_pairs)
         batch_pairs = all_pairs[batch_start:batch_end]
 
@@ -203,6 +214,9 @@ def generate_synthetic_data(
         batch_question_indices = []
         for q_idx, s_idx in batch_pairs:
             question = questions[q_idx]
+
+            print(f"[DEBUG] `generate_synthetic_data` question q_idx: {q_idx}, s_idx: {s_idx}, question: {question}")
+
             chat = [
                 {
                     "role": "user",
@@ -261,6 +275,9 @@ def generate_synthetic_data(
             gen_ids=gen_ids,
             tokenizer=tokenizer,
         )
+
+        print(f"[DEBUG] `generate_synthetic_data` logprobs = {logprobs}")
+        import code; code.interact(local=locals())
 
         # Process results and organize by question
         for i, (q_idx, s_idx) in enumerate(batch_pairs):
@@ -438,10 +455,10 @@ if __name__ == "__main__":
         # Question:
         {question}
     """
-    num_questions = 50
-    num_samples_per_question = 10
-    num_examples = 2
-    batch_size = 8
+    num_questions = 2
+    num_samples_per_question = 1
+    num_examples = 1
+    batch_size = 2
     temperature = 1.5
     max_new_tokens = 256
     print("Settings:")

@@ -79,7 +79,8 @@ def prepare_dpo_sample(
         truncation=True,
         max_length=max_absolute_length,
         return_tensors="pt",
-        padding=False
+        # padding=False
+        padding=True  # DEBUG:
     )
     
     reject_tokens = tokenizer(
@@ -87,7 +88,8 @@ def prepare_dpo_sample(
         truncation=True,
         max_length=max_absolute_length,
         return_tensors="pt",
-        padding=False
+        # padding=False
+        padding=True  # DEBUG:
     )
     
     # Also tokenize just the question part to identify where the answer starts
@@ -100,7 +102,8 @@ def prepare_dpo_sample(
         truncation=True,
         max_length=max_absolute_length,
         return_tensors="pt",
-        padding=False
+        # padding=False
+        padding=True, # DEBUG:
     )
 
     # Calculate answer start positions and lengths for both chosen and rejected solutions
@@ -248,6 +251,20 @@ def compute_dpo_loss_batch(
         no_grad=no_grad,
     )
 
+    ref_logprobs_check, _ = forward_logprobs(
+        model=policy_model,  # Same model used for reference
+        tokenizer=tokenizer,
+        input_ids=batch["chosen_input_ids"].to(device),
+        attention_mask=batch["chosen_attention_mask"].to(device),
+        answer_start_positions=batch["chosen_answer_start"].to(device),
+        answer_lengths=batch["chosen_answer_length"].to(device),
+        no_grad=True,
+    )
+    # These should be very close to batch["chosen_logprobs"]
+    print("Logprob difference:", (ref_logprobs_check.cpu() - batch["chosen_logprobs"].cpu()).abs().mean())
+
+    import code; code.interact(local=locals())  # Debugging line to inspect variables
+
     reference_model_log_probas = batch["chosen_logprobs"].to(device)
     reference_rejected_log_probas = batch["reject_logprobs"].to(device)
 
@@ -293,13 +310,6 @@ def train(
     """
     Main training function for DPO.
     """
-    run_id = wandb.run.id
-    print(f"Run ID: {run_id}")
-
-    model_dir = f"models/{args.config}/{run_id}"
-    os.makedirs(model_dir, exist_ok=True)
-    print(f"Model will be saved to: {model_dir}")
-
     # Setup LoRA if enabled
     model = setup_lora_model(model, config)
 
@@ -316,7 +326,7 @@ def train(
         train_dataset,
         collate_fn=batch_collate_fn,
         batch_size=config.batch_size,
-        shuffle=True
+        shuffle=False
     )
     
     val_dataloader = DataLoader(
@@ -486,10 +496,17 @@ if __name__ == "__main__":
             "lora_bias": getattr(config, 'lora_bias', "none"),
         })
 
-    wandb.init(
-        project=config.wandb_project,
-        entity=config.wandb_entity,
-        config=wandb_config
-    )
+    # wandb.init(
+    #     project=config.wandb_project,
+    #     entity=config.wandb_entity,
+    #     config=wandb_config
+    # )
+
+    # run_id = wandb.run.id
+    # print(f"Run ID: {run_id}")
+
+    # model_dir = f"models/{args.config}/{run_id}"
+    # os.makedirs(model_dir, exist_ok=True)
+    # print(f"Model will be saved to: {model_dir}")
 
     train(model, tokenizer, hf_dataset, config)
