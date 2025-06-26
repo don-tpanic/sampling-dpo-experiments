@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
+from peft import LoraConfig, get_peft_model, TaskType
 import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
 
@@ -260,6 +261,27 @@ def compute_dpo_loss_batch(
     return loss, chosen_rewards, rejected_rewards
 
 
+def setup_lora_model(model: AutoModelForCausalLM, config: TrainConfig) -> AutoModelForCausalLM:
+    """
+    Setup LoRA configuration and wrap the model if LoRA is enabled.
+    """
+    if not getattr(config, 'use_lora', False):
+        return model
+    
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=getattr(config, 'lora_r', 16),
+        lora_alpha=getattr(config, 'lora_alpha', 32),
+        lora_dropout=getattr(config, 'lora_dropout', 0.1),
+        target_modules=getattr(config, 'lora_target_modules', ["q_proj", "v_proj"]),
+        bias=getattr(config, 'lora_bias', "none"),
+    )
+    
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model
+
+
 def train(
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
@@ -275,6 +297,9 @@ def train(
     model_dir = f"models/{run_id}"
     os.makedirs(model_dir, exist_ok=True)
     print(f"Model will be saved to: {model_dir}")
+
+    # Setup LoRA if enabled
+    model = setup_lora_model(model, config)
 
     train_dataset, val_dataset = create_train_val_split(dataset, config.validation_split)
     
@@ -437,18 +462,32 @@ if __name__ == "__main__":
     torch.manual_seed(config.random_seed)
     torch.cuda.manual_seed(config.random_seed)
 
+    # Add LoRA config to wandb logging
+    wandb_config = {
+        "learning_rate": config.lr,
+        "epochs": config.epochs,
+        "batch_size": config.batch_size,
+        "device": config.device,
+        "validation_split": config.validation_split,
+        "max_absolute_length": config.max_absolute_length,
+        "beta": config.beta
+    }
+    
+    # Add LoRA parameters to wandb config if enabled
+    if getattr(config, 'use_lora', False):
+        wandb_config.update({
+            "use_lora": True,
+            "lora_r": getattr(config, 'lora_r', 16),
+            "lora_alpha": getattr(config, 'lora_alpha', 32),
+            "lora_dropout": getattr(config, 'lora_dropout', 0.1),
+            "lora_target_modules": getattr(config, 'lora_target_modules', ["q_proj", "v_proj"]),
+            "lora_bias": getattr(config, 'lora_bias', "none"),
+        })
+
     wandb.init(
         project=config.wandb_project,
         entity=config.wandb_entity,
-        config={
-            "learning_rate": config.lr,
-            "epochs": config.epochs,
-            "batch_size": config.batch_size,
-            "device": config.device,
-            "validation_split": config.validation_split,
-            "max_absolute_length": config.max_absolute_length,
-            "beta": config.beta
-        }
+        config=wandb_config
     )
 
     train(model, tokenizer, hf_dataset, config)
