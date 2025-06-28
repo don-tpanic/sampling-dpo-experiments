@@ -8,9 +8,10 @@ import wandb
 import tqdm
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import datasets
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
-# from peft import LoraConfig, get_peft_model, TaskType
+import copy
 import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
 
@@ -56,15 +57,27 @@ def prepare_dpo_sample(
     """
     # Create chat templates for chosen and rejected responses
     chosen_chat = [
-        {"role": "user", "content": question},
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        },
         {"role": "assistant", "content": chosen_solution}
     ]
     
     reject_chat = [
-        {"role": "user", "content": question},
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        },
         {"role": "assistant", "content": reject_solution}
     ]
-    
+
     # Apply chat template and tokenize
     chosen_text = tokenizer.apply_chat_template(
         chosen_chat, tokenize=False, add_generation_prompt=False
@@ -74,6 +87,7 @@ def prepare_dpo_sample(
     )
 
     # Tokenize the full sequences without truncation (except safety limit)
+    # No padding as this is a single sample.
     chosen_tokens = tokenizer(
         chosen_text,
         truncation=True,
@@ -91,7 +105,15 @@ def prepare_dpo_sample(
     )
     
     # Also tokenize just the question part to identify where the answer starts
-    question_chat = [{"role": "user", "content": question}]
+    question_chat = [
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        }
+    ]
     question_text = tokenizer.apply_chat_template(
         question_chat, tokenize=False, add_generation_prompt=True
     )
@@ -108,7 +130,6 @@ def prepare_dpo_sample(
     reject_answer_start = len(question_tokens["input_ids"][0])
     chosen_answer_length = len(chosen_tokens["input_ids"][0]) - chosen_answer_start
     reject_answer_length = len(reject_tokens["input_ids"][0]) - reject_answer_start
-    
     return {
         "chosen_input_ids": chosen_tokens["input_ids"].squeeze(0),
         "chosen_attention_mask": chosen_tokens["attention_mask"].squeeze(0),
@@ -140,9 +161,6 @@ def collate_fn(
             tokenizer=tokenizer,
             max_absolute_length=max_absolute_length
         )
-        # Add the logprobs produced by the initial (reference) model
-        sample["chosen_logprobs"] = item["chosen_logprobs"]
-        sample["reject_logprobs"] = item["reject_logprobs"]
         prepared_samples.append(sample)
     
     # Extract all tensors for batching
@@ -177,10 +195,6 @@ def collate_fn(
     chosen_attention_masks = pad_to_length(chosen_attention_masks, batch_max_length, 0)
     reject_input_ids = pad_to_length(reject_input_ids, batch_max_length, tokenizer.pad_token_id)
     reject_attention_masks = pad_to_length(reject_attention_masks, batch_max_length, 0)
-    
-    # Collect other data
-    chosen_logprobs = torch.stack([torch.tensor(sample["chosen_logprobs"]) for sample in prepared_samples])
-    reject_logprobs = torch.stack([torch.tensor(sample["reject_logprobs"]) for sample in prepared_samples])
 
     return {
         "chosen_input_ids": chosen_input_ids,
@@ -191,8 +205,6 @@ def collate_fn(
         "reject_answer_length": torch.stack(reject_answer_lengths),
         "reject_input_ids": reject_input_ids,
         "reject_attention_mask": reject_attention_masks,
-        "chosen_logprobs": chosen_logprobs,
-        "reject_logprobs": reject_logprobs,
         "batch_max_length": batch_max_length,
     }
 
@@ -224,6 +236,7 @@ def compute_dpo_loss(
 def compute_dpo_loss_batch(
         batch,
         policy_model,
+        reference_model,
         tokenizer,
         device,
         beta,
@@ -248,13 +261,30 @@ def compute_dpo_loss_batch(
         no_grad=no_grad,
     )
 
-    reference_model_log_probas = batch["chosen_logprobs"].to(device)
-    reference_rejected_log_probas = batch["reject_logprobs"].to(device)
+    # Generate reference logprobs on-the-fly using the reference model
+    reference_chosen_log_probas, _ = forward_logprobs(
+        model=reference_model,
+        tokenizer=tokenizer,
+        input_ids=batch["chosen_input_ids"].to(device),
+        attention_mask=batch["chosen_attention_mask"].to(device),
+        answer_start_positions=batch["chosen_answer_start"].to(device),
+        answer_lengths=batch["chosen_answer_length"].to(device),
+        no_grad=True,
+    )
+    reference_rejected_log_probas, _ = forward_logprobs(
+        model=reference_model,
+        tokenizer=tokenizer,
+        input_ids=batch["reject_input_ids"].to(device),
+        attention_mask=batch["reject_attention_mask"].to(device),
+        answer_start_positions=batch["reject_answer_start"].to(device),
+        answer_lengths=batch["reject_answer_length"].to(device),
+        no_grad=True,
+    )
 
     loss, chosen_rewards, rejected_rewards = compute_dpo_loss(
         model_chosen_logprobs=policy_chosen_log_probas,
         model_rejected_logprobs=policy_rejected_log_probas,
-        reference_chosen_logprobs=reference_model_log_probas,
+        reference_chosen_logprobs=reference_chosen_log_probas,
         reference_rejected_logprobs=reference_rejected_log_probas,
         beta=beta
     )
@@ -300,6 +330,12 @@ def train(
     os.makedirs(model_dir, exist_ok=True)
     print(f"Model will be saved to: {model_dir}")
 
+    # Create reference model as a frozen copy before applying LoRA
+    reference_model = copy.deepcopy(model)
+    reference_model.eval()
+    for param in reference_model.parameters():
+        param.requires_grad = False
+
     # Setup LoRA if enabled
     model = setup_lora_model(model, config)
 
@@ -331,6 +367,7 @@ def train(
     
     # Move model to device
     model = model.to(config.device)
+    reference_model = reference_model.to(config.device)
     
     # Training loop
     for epoch in tqdm.tqdm(range(config.epochs), desc="Training"):
@@ -350,6 +387,7 @@ def train(
             loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                 batch=batch,
                 policy_model=model,
+                reference_model=reference_model,
                 tokenizer=tokenizer,
                 device=config.device,
                 beta=config.beta,
@@ -376,7 +414,7 @@ def train(
                 }
                 wandb.log(batch_metrics)
                 print(f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {loss.item():.4f}")
-
+        
         avg_train_loss = total_train_loss / num_train_batches
         avg_train_chosen_rewards = total_train_chosen_rewards / num_train_batches
         avg_train_rejected_rewards = total_train_rejected_rewards / num_train_batches
@@ -393,6 +431,7 @@ def train(
                 loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                     batch=batch,
                     policy_model=model,
+                    reference_model=reference_model,
                     tokenizer=tokenizer,
                     device=config.device,
                     beta=config.beta,
@@ -443,6 +482,13 @@ if __name__ == "__main__":
     config_dict = utils.load_config(args.config)
     config = TrainConfig(config_dict)
     os.environ["CUDA_VISIBLE_DEVICES"] = config.cuda_device
+    
+    # Load original dataset to get n-shot examples
+    dataset = datasets.load_dataset("openai/gsm8k", "main")['train']
+    _, _, n_shot_examples = utils.generate_n_shot_examples(
+        dataset['question'], dataset['answer'], num_examples=config.num_examples,
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         device_map="cuda",
@@ -454,12 +500,20 @@ if __name__ == "__main__":
     hf_dataset = Dataset.from_dict({
         "questions": prepared_training_data["questions"],
         "chosen_solutions": prepared_training_data["chosen_solutions"],
-        "chosen_logprobs": prepared_training_data["chosen_logprobs"],
-        "chosen_selfcertainties": prepared_training_data["chosen_selfcertainties"],
         "reject_solutions": prepared_training_data["reject_solutions"],
-        "reject_logprobs": prepared_training_data["reject_logprobs"],
-        "reject_selfcertainties": prepared_training_data["reject_selfcertainties"],
     })
+
+    # Prepare prompt template
+    prompt_template = """You are given a math question. You must provide a concise step-by-step reasoning
+        and a final answer. Your response should follow strictly the format of the provided examples where each new line is a reasoning step
+        written in a very concise style, and the final answer is on the last line. There should be roughly 2-4 steps, but it is okay
+        to have more or less steps if needed.
+        
+        {n_shot_examples}
+
+        # Question:
+        {question}
+    """
 
     torch.manual_seed(config.random_seed)
     torch.cuda.manual_seed(config.random_seed)

@@ -271,12 +271,13 @@ def forward_pass_compute_logprobs_n_selfcertainties(
     for i in range(batch_size):
         answer_start = answer_start_positions[i]
         answer_length = answer_lengths[i]
+    
+        # Since labels = input_ids[:, 1:], we need to shift answer_start by -1
+        shifted_answer_start = max(0, answer_start - 1)
+        shifted_answer_end = min(shifted_answer_start + answer_length, seq_len)
         
-        # Only mask answer tokens (from answer_start to answer_start + answer_length - 1)
-        # Note: we subtract 1 because labels is shifted by 1 position
-        answer_end = min(answer_start + answer_length - 1, seq_len)
-        if answer_start < seq_len:
-            mask[i, answer_start:answer_end] = 1.0
+        if shifted_answer_start < seq_len and answer_length > 0:
+            mask[i, shifted_answer_start:shifted_answer_end] = 1.0
     
     # Also mask out padding tokens
     mask = mask * (labels != tokenizer.pad_token_id).float()
