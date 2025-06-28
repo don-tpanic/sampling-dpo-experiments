@@ -8,10 +8,10 @@ import wandb
 import tqdm
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import datasets
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
 import copy
-# from peft import LoraConfig, get_peft_model, TaskType
 import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
 
@@ -57,15 +57,27 @@ def prepare_dpo_sample(
     """
     # Create chat templates for chosen and rejected responses
     chosen_chat = [
-        {"role": "user", "content": question},
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        },
         {"role": "assistant", "content": chosen_solution}
     ]
     
     reject_chat = [
-        {"role": "user", "content": question},
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        },
         {"role": "assistant", "content": reject_solution}
     ]
-    
+
     # Apply chat template and tokenize
     chosen_text = tokenizer.apply_chat_template(
         chosen_chat, tokenize=False, add_generation_prompt=False
@@ -93,7 +105,15 @@ def prepare_dpo_sample(
     )
     
     # Also tokenize just the question part to identify where the answer starts
-    question_chat = [{"role": "user", "content": question}]
+    question_chat = [
+        {
+            "role": "user", 
+            "content": prompt_template.format(
+                n_shot_examples=n_shot_examples,
+                question=question
+            )
+        }
+    ]
     question_text = tokenizer.apply_chat_template(
         question_chat, tokenize=False, add_generation_prompt=True
     )
@@ -175,7 +195,7 @@ def collate_fn(
     chosen_attention_masks = pad_to_length(chosen_attention_masks, batch_max_length, 0)
     reject_input_ids = pad_to_length(reject_input_ids, batch_max_length, tokenizer.pad_token_id)
     reject_attention_masks = pad_to_length(reject_attention_masks, batch_max_length, 0)
-    
+
     return {
         "chosen_input_ids": chosen_input_ids,
         "chosen_attention_mask": chosen_attention_masks,
@@ -394,7 +414,7 @@ def train(
                 }
                 wandb.log(batch_metrics)
                 print(f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {loss.item():.4f}")
-
+        
         avg_train_loss = total_train_loss / num_train_batches
         avg_train_chosen_rewards = total_train_chosen_rewards / num_train_batches
         avg_train_rejected_rewards = total_train_rejected_rewards / num_train_batches
@@ -462,6 +482,13 @@ if __name__ == "__main__":
     config_dict = utils.load_config(args.config)
     config = TrainConfig(config_dict)
     os.environ["CUDA_VISIBLE_DEVICES"] = config.cuda_device
+    
+    # Load original dataset to get n-shot examples
+    dataset = datasets.load_dataset("openai/gsm8k", "main")['train']
+    _, _, n_shot_examples = utils.generate_n_shot_examples(
+        dataset['question'], dataset['answer'], num_examples=config.num_examples,
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         device_map="cuda",
@@ -475,6 +502,18 @@ if __name__ == "__main__":
         "chosen_solutions": prepared_training_data["chosen_solutions"],
         "reject_solutions": prepared_training_data["reject_solutions"],
     })
+
+    # Prepare prompt template
+    prompt_template = """You are given a math question. You must provide a concise step-by-step reasoning
+        and a final answer. Your response should follow strictly the format of the provided examples where each new line is a reasoning step
+        written in a very concise style, and the final answer is on the last line. There should be roughly 2-4 steps, but it is okay
+        to have more or less steps if needed.
+        
+        {n_shot_examples}
+
+        # Question:
+        {question}
+    """
 
     torch.manual_seed(config.random_seed)
     torch.cuda.manual_seed(config.random_seed)
