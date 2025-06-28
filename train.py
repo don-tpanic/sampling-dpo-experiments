@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
 from typing import Tuple, Dict, List, Any
+import copy
 # from peft import LoraConfig, get_peft_model, TaskType
 import utils
 from utils import forward_pass_compute_logprobs_n_selfcertainties as forward_logprobs
@@ -74,6 +75,7 @@ def prepare_dpo_sample(
     )
 
     # Tokenize the full sequences without truncation (except safety limit)
+    # No padding as this is a single sample.
     chosen_tokens = tokenizer(
         chosen_text,
         truncation=True,
@@ -108,7 +110,6 @@ def prepare_dpo_sample(
     reject_answer_start = len(question_tokens["input_ids"][0])
     chosen_answer_length = len(chosen_tokens["input_ids"][0]) - chosen_answer_start
     reject_answer_length = len(reject_tokens["input_ids"][0]) - reject_answer_start
-    
     return {
         "chosen_input_ids": chosen_tokens["input_ids"].squeeze(0),
         "chosen_attention_mask": chosen_tokens["attention_mask"].squeeze(0),
@@ -140,9 +141,6 @@ def collate_fn(
             tokenizer=tokenizer,
             max_absolute_length=max_absolute_length
         )
-        # Add the logprobs produced by the initial (reference) model
-        sample["chosen_logprobs"] = item["chosen_logprobs"]
-        sample["reject_logprobs"] = item["reject_logprobs"]
         prepared_samples.append(sample)
     
     # Extract all tensors for batching
@@ -178,10 +176,6 @@ def collate_fn(
     reject_input_ids = pad_to_length(reject_input_ids, batch_max_length, tokenizer.pad_token_id)
     reject_attention_masks = pad_to_length(reject_attention_masks, batch_max_length, 0)
     
-    # Collect other data
-    chosen_logprobs = torch.stack([torch.tensor(sample["chosen_logprobs"]) for sample in prepared_samples])
-    reject_logprobs = torch.stack([torch.tensor(sample["reject_logprobs"]) for sample in prepared_samples])
-
     return {
         "chosen_input_ids": chosen_input_ids,
         "chosen_attention_mask": chosen_attention_masks,
@@ -191,8 +185,6 @@ def collate_fn(
         "reject_answer_length": torch.stack(reject_answer_lengths),
         "reject_input_ids": reject_input_ids,
         "reject_attention_mask": reject_attention_masks,
-        "chosen_logprobs": chosen_logprobs,
-        "reject_logprobs": reject_logprobs,
         "batch_max_length": batch_max_length,
     }
 
@@ -224,6 +216,7 @@ def compute_dpo_loss(
 def compute_dpo_loss_batch(
         batch,
         policy_model,
+        reference_model,
         tokenizer,
         device,
         beta,
@@ -248,13 +241,30 @@ def compute_dpo_loss_batch(
         no_grad=no_grad,
     )
 
-    reference_model_log_probas = batch["chosen_logprobs"].to(device)
-    reference_rejected_log_probas = batch["reject_logprobs"].to(device)
+    # Generate reference logprobs on-the-fly using the reference model
+    reference_chosen_log_probas, _ = forward_logprobs(
+        model=reference_model,
+        tokenizer=tokenizer,
+        input_ids=batch["chosen_input_ids"].to(device),
+        attention_mask=batch["chosen_attention_mask"].to(device),
+        answer_start_positions=batch["chosen_answer_start"].to(device),
+        answer_lengths=batch["chosen_answer_length"].to(device),
+        no_grad=True,
+    )
+    reference_rejected_log_probas, _ = forward_logprobs(
+        model=reference_model,
+        tokenizer=tokenizer,
+        input_ids=batch["reject_input_ids"].to(device),
+        attention_mask=batch["reject_attention_mask"].to(device),
+        answer_start_positions=batch["reject_answer_start"].to(device),
+        answer_lengths=batch["reject_answer_length"].to(device),
+        no_grad=True,
+    )
 
     loss, chosen_rewards, rejected_rewards = compute_dpo_loss(
         model_chosen_logprobs=policy_chosen_log_probas,
         model_rejected_logprobs=policy_rejected_log_probas,
-        reference_chosen_logprobs=reference_model_log_probas,
+        reference_chosen_logprobs=reference_chosen_log_probas,
         reference_rejected_logprobs=reference_rejected_log_probas,
         beta=beta
     )
@@ -300,6 +310,12 @@ def train(
     os.makedirs(model_dir, exist_ok=True)
     print(f"Model will be saved to: {model_dir}")
 
+    # Create reference model as a frozen copy before applying LoRA
+    reference_model = copy.deepcopy(model)
+    reference_model.eval()
+    for param in reference_model.parameters():
+        param.requires_grad = False
+
     # Setup LoRA if enabled
     model = setup_lora_model(model, config)
 
@@ -331,6 +347,7 @@ def train(
     
     # Move model to device
     model = model.to(config.device)
+    reference_model = reference_model.to(config.device)
     
     # Training loop
     for epoch in tqdm.tqdm(range(config.epochs), desc="Training"):
@@ -350,6 +367,7 @@ def train(
             loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                 batch=batch,
                 policy_model=model,
+                reference_model=reference_model,
                 tokenizer=tokenizer,
                 device=config.device,
                 beta=config.beta,
@@ -393,6 +411,7 @@ def train(
                 loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                     batch=batch,
                     policy_model=model,
+                    reference_model=reference_model,
                     tokenizer=tokenizer,
                     device=config.device,
                     beta=config.beta,
@@ -454,11 +473,7 @@ if __name__ == "__main__":
     hf_dataset = Dataset.from_dict({
         "questions": prepared_training_data["questions"],
         "chosen_solutions": prepared_training_data["chosen_solutions"],
-        "chosen_logprobs": prepared_training_data["chosen_logprobs"],
-        "chosen_selfcertainties": prepared_training_data["chosen_selfcertainties"],
         "reject_solutions": prepared_training_data["reject_solutions"],
-        "reject_logprobs": prepared_training_data["reject_logprobs"],
-        "reject_selfcertainties": prepared_training_data["reject_selfcertainties"],
     })
 
     torch.manual_seed(config.random_seed)
