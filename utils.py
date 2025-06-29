@@ -75,16 +75,11 @@ def evaluate_model(
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         batch_size: int = 8,
-        num_examples: int = 8,
+        n_shot_examples: str = "",
     ) -> float:
     questions = eval_dataset['question']
     answers = eval_dataset['answer']
     all_scores = []
-
-    # Generate n-shot examples from the dataset
-    questions, answers, n_shot_examples = generate_n_shot_examples(
-        questions, answers, num_examples
-    )
     
     # Process data in batches
     for batch_start in tqdm.tqdm(range(0, len(questions), batch_size), desc="Evaluating model"):
