@@ -80,6 +80,7 @@ def evaluate_model(
     questions = eval_dataset['question']
     answers = eval_dataset['answer']
     all_scores = []
+    all_outputs = {} # collect sample correctness and predictions
     
     # Process data in batches
     for batch_start in tqdm.tqdm(range(0, len(questions), batch_size), desc="Evaluating model"):
@@ -145,9 +146,20 @@ def evaluate_model(
         
         # Add batch scores to global scores
         all_scores.extend(batch_scores)
+
+        # Collect outputs for each sample
+        for i in range(batch_start, batch_end):
+            all_outputs[i] = {
+                "question": batch_questions[i - batch_start],
+                "predicted_answer": batch_predictions[i - batch_start],
+                "true_answer": batch_answers[i - batch_start],
+                "is_correct": batch_scores[i - batch_start],
+            }
     
-    # Calculate final accuracy
-    return sum(all_scores) / len(all_scores)
+    acc = sum(all_scores) / len(all_scores)
+    print(f"Accuracy: {acc:.2f}")
+    print(f"Total samples evaluated: {len(all_scores)}")
+    return acc, all_outputs
 
 
 def compute_logprobs_n_selfcertainties(
