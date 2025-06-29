@@ -114,7 +114,7 @@ def evaluate_model(
         
         # Generate responses for the batch
         with torch.no_grad():
-            output_ids = model.generate(
+            outputs = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
@@ -122,38 +122,52 @@ def evaluate_model(
                 temperature=temperature,
                 num_return_sequences=1,
                 pad_token_id=tokenizer.pad_token_id,
+                output_logits=True,
+                return_dict_in_generate=True,
             )
+
+        output_ids = outputs.sequences  # shape: (bsz, seq_len)
+        logits = outputs.logits # tuple of (bsz, vocab_size), length = num_new_tokens
         
-        # Decode batch outputs
-        batch_predictions = []
-        for i in range(len(batch_questions)):
+        # Convert logits to tensor (bsz, num_new_tokens, vocab_size)
+        # in order to compute logprobs and self-certainties
+        logits = torch.stack(logits, dim=1)  # shape: (bsz, num_new_tokens, vocab_size)
+        gen_ids = output_ids[:, input_ids.shape[1]:]  # only generated tokens, shape: (bsz, num_new_tokens)
+        assert gen_ids.shape[1] == logits.shape[1], \
+            "Generated tokens and logits must match in length."
+
+        # Compute logprobs and self-certainties
+        logprobs, selfcertainties = compute_logprobs_n_selfcertainties(
+            logits=logits,
+            gen_ids=gen_ids,
+            tokenizer=tokenizer,
+        )
+
+        for global_idx in range(batch_start, batch_end):
+            local_idx = global_idx - batch_start
+
             # Extract only the generated portion (skip input tokens)
-            generated_tokens = output_ids[i][len(input_ids[i]):]
+            generated_tokens = output_ids[local_idx][len(input_ids[local_idx]):]
             ans_pred = tokenizer.decode(
                 generated_tokens,
                 skip_special_tokens=True,
             )
-            print(f"\n{i}: Decoded answer:\n{ans_pred}")
-            batch_predictions.append(ans_pred)
-        
-        # Evaluate correctness for each item in the batch
-        batch_scores = []
-        for pred, answer in zip(batch_predictions, batch_answers):
-            if is_correct_solution(pred, answer):
-                batch_scores.append(1.0)
-            else:
-                batch_scores.append(0.0)
-        
-        # Add batch scores to global scores
-        all_scores.extend(batch_scores)
+            print(f"\n[{global_idx}, {local_idx}]: Decoded answer:\n{ans_pred}")
 
-        # Collect outputs for each sample
-        for i in range(batch_start, batch_end):
-            all_outputs[i] = {
-                "question": batch_questions[i - batch_start],
-                "predicted_answer": batch_predictions[i - batch_start],
-                "true_answer": batch_answers[i - batch_start],
-                "is_correct": batch_scores[i - batch_start],
+            # Evaluate correctness
+            if is_correct_solution(ans_pred, batch_answers[local_idx]):
+                all_scores.append(1.0)
+            else:
+                all_scores.append(0.0)
+
+            # Collect outputs for each sample
+            all_outputs[global_idx] = {
+                "question": batch_questions[local_idx],
+                "predicted_answer": ans_pred,
+                "true_answer": batch_answers[local_idx],
+                "is_correct": all_scores[-1],
+                "logprobs": logprobs[local_idx],
+                "self_certainty": selfcertainties[local_idx],
             }
     
     acc = sum(all_scores) / len(all_scores)
