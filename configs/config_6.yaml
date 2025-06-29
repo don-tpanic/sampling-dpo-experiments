@@ -1,0 +1,34 @@
+# DPO Training Configuration
+# configs/config_6.yaml
+
+# Training hyperparameters
+lr: 3.0e-5
+epochs: 10
+batch_size: 4
+beta: 0.1
+weight_decay: 0.01
+
+# LoRA
+use_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.1
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_bias: "none"
+
+# Model and data configuration
+max_absolute_length: 2048
+validation_split: 0.1
+model_name: "microsoft/Phi-3.5-mini-instruct"
+data_path: "data/prepared_training_data_temp1.5_bsz8_shot2_q5000.pt"
+
+# Device configuration
+device: "cuda"
+cuda_device: "0"
+
+# Wandb configuration
+wandb_project: "dpo-training"
+wandb_entity: "kenotron"
+
+# Random seed
+random_seed: 42
