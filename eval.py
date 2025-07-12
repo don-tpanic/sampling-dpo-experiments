@@ -3,7 +3,7 @@ import os
 import torch
 import datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from . import utils
+import utils
 
 
 def load_peft_model(
