@@ -215,7 +215,9 @@ def compute_dpo_loss(
         reference_chosen_logprobs: torch.Tensor,
         reference_rejected_logprobs: torch.Tensor,
         beta: float = 0.1,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        add_sft_loss: bool = False,
+        sft_loss_weight: float = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
         A tuple of three tensors: (loss, chosen_rewards, rejected_rewards)
@@ -225,12 +227,20 @@ def compute_dpo_loss(
     logits = model_logratios - reference_logratios
     
     # DPO loss
-    losses = -F.logsigmoid(logits * beta)
+    dpo_losses = -F.logsigmoid(logits * beta)
+
+    # Optional sft loss
+    sft_losses = -model_chosen_logprobs
+    if add_sft_loss is True:
+        losses = dpo_losses + sft_losses * sft_loss_weight
+    else:
+        losses = dpo_losses
 
     chosen_rewards = (model_chosen_logprobs - reference_chosen_logprobs).detach()
     rejected_rewards = (model_rejected_logprobs - reference_rejected_logprobs).detach()
 
-    return losses.mean(), chosen_rewards, rejected_rewards
+    return losses.mean(), dpo_losses.mean(), sft_losses.mean(), \
+        chosen_rewards, rejected_rewards
 
 
 def compute_dpo_loss_batch(
@@ -241,6 +251,8 @@ def compute_dpo_loss_batch(
         device,
         beta,
         no_grad,
+        add_sft_loss,
+        sft_loss_weight,
     ):
     policy_chosen_log_probas, _ = forward_logprobs(
         model=policy_model,
@@ -281,14 +293,16 @@ def compute_dpo_loss_batch(
         no_grad=True,
     )
 
-    loss, chosen_rewards, rejected_rewards = compute_dpo_loss(
+    loss, dpo_loss, sft_loss, chosen_rewards, rejected_rewards = compute_dpo_loss(
         model_chosen_logprobs=policy_chosen_log_probas,
         model_rejected_logprobs=policy_rejected_log_probas,
         reference_chosen_logprobs=reference_chosen_log_probas,
         reference_rejected_logprobs=reference_rejected_log_probas,
-        beta=beta
+        beta=beta,
+        add_sft_loss=add_sft_loss,
+        sft_loss_weight=sft_loss_weight,
     )
-    return loss, chosen_rewards, rejected_rewards
+    return loss, dpo_loss, sft_loss, chosen_rewards, rejected_rewards
 
 
 def setup_lora_model(model: AutoModelForCausalLM, config: TrainConfig) -> AutoModelForCausalLM:
@@ -383,26 +397,37 @@ def train(
         # Training phase
         model.train()
         total_train_loss = 0
+        total_train_dpo_loss = 0
+        total_train_sft_loss = 0
         total_train_chosen_rewards = 0
         total_train_rejected_rewards = 0
         num_train_batches = 0
         accumulation_loss = 0
+        accumulation_dpo_loss = 0
+        accumulation_sft_loss = 0
 
         for batch_idx, batch in enumerate(train_dataloader):
             # Compute loss and rewards
-            loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
+            loss, dpo_loss, sft_loss, \
+            chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                 batch=batch,
                 policy_model=model,
                 reference_model=reference_model,
                 tokenizer=tokenizer,
                 device=config.device,
                 beta=config.beta,
-                no_grad=False
+                no_grad=False,
+                add_sft_loss=config.add_sft_loss,
+                sft_loss_weight=config.sft_loss_weight,
             )
             
             loss = loss / gradient_accumulation_steps
+            dpo_loss = dpo_loss / gradient_accumulation_steps
+            sft_loss = sft_loss / gradient_accumulation_steps
             loss.backward()
             accumulation_loss += loss.item()
+            accumulation_dpo_loss += dpo_loss.item()
+            accumulation_sft_loss += sft_loss.item()
             
             # Only step optimizer and zero gradients every gradient_accumulation_steps
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
@@ -411,9 +436,13 @@ def train(
                 
                 # Log the accumulated loss (multiply back by gradient_accumulation_steps for original scale)
                 actual_loss = accumulation_loss * gradient_accumulation_steps
+                actual_dpo_loss = accumulation_dpo_loss * gradient_accumulation_steps
+                actual_sft_loss = accumulation_sft_loss * gradient_accumulation_steps
                 
                 # Accumulate metrics
                 total_train_loss += actual_loss
+                total_train_dpo_loss += actual_dpo_loss
+                total_train_sft_loss += actual_sft_loss
                 total_train_chosen_rewards += chosen_rewards.mean().item()
                 total_train_rejected_rewards += rejected_rewards.mean().item()
                 num_train_batches += 1
@@ -422,6 +451,8 @@ def train(
                 if (batch_idx + 1) // gradient_accumulation_steps % 10 == 0:
                     batch_metrics = {
                         "batch_loss": actual_loss,
+                        "batch_dpo_loss": actual_dpo_loss,
+                        "batch_sft_loss": actual_sft_loss,
                         "batch_chosen_rewards": chosen_rewards.mean().item(),
                         "batch_reject_rewards": rejected_rewards.mean().item(),
                         "batch_rewards_margin": (chosen_rewards - rejected_rewards).mean().item(),
@@ -431,10 +462,16 @@ def train(
                         "global_step": epoch * (len(train_dataloader) // gradient_accumulation_steps) + ((batch_idx + 1) // gradient_accumulation_steps)
                     }
                     wandb.log(batch_metrics)
-                    print(f"  Step {(batch_idx + 1) // gradient_accumulation_steps}, Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {actual_loss:.4f}")
+                    print(
+                        f"  Step {(batch_idx + 1) // gradient_accumulation_steps}, "\
+                        f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {actual_loss:.4f}"\
+                        f"  DPO Loss: {actual_dpo_loss:.4f}, SFT Loss: {actual_sft_loss:.4f}"
+                    )
                 
                 # Reset accumulation loss
                 accumulation_loss = 0
+                accumulation_dpo_loss = 0
+                accumulation_sft_loss = 0
         
         # Handle remaining gradients if the last batch doesn't complete a full accumulation cycle
         if len(train_dataloader) % gradient_accumulation_steps != 0:
@@ -445,9 +482,13 @@ def train(
             if accumulation_loss > 0:
                 actual_loss = accumulation_loss * gradient_accumulation_steps
                 total_train_loss += actual_loss
+                total_train_dpo_loss += accumulation_dpo_loss
+                total_train_sft_loss += accumulation_sft_loss
                 num_train_batches += 1
         
         avg_train_loss = total_train_loss / max(num_train_batches, 1)
+        avg_train_dpo_loss = total_train_dpo_loss / max(num_train_batches, 1)
+        avg_train_sft_loss = total_train_sft_loss / max(num_train_batches, 1)
         avg_train_chosen_rewards = total_train_chosen_rewards / max(num_train_batches, 1)
         avg_train_rejected_rewards = total_train_rejected_rewards / max(num_train_batches, 1)
         print(f"  Average training loss: {avg_train_loss:.4f}")
@@ -455,27 +496,36 @@ def train(
         # Validation phase
         model.eval()
         total_val_loss = 0
+        total_val_dpo_loss = 0
+        total_val_sft_loss = 0
         total_val_chosen_rewards = 0
         total_val_rejected_rewards = 0
         num_val_batches = 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader):
-                loss, chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
+                loss, dpo_loss, sft_loss, \
+                chosen_rewards, rejected_rewards = compute_dpo_loss_batch(
                     batch=batch,
                     policy_model=model,
                     reference_model=reference_model,
                     tokenizer=tokenizer,
                     device=config.device,
                     beta=config.beta,
-                    no_grad=True
+                    no_grad=True,
+                    add_sft_loss=config.add_sft_loss,
+                    sft_loss_weight=config.sft_loss_weight,
                 )
                 
                 total_val_loss += loss.item()
+                total_val_dpo_loss += dpo_loss.item()
+                total_val_sft_loss += sft_loss.item()
                 total_val_chosen_rewards += chosen_rewards.mean().item()
                 total_val_rejected_rewards += rejected_rewards.mean().item()
                 num_val_batches += 1
                         
         avg_val_loss = total_val_loss / num_val_batches
+        avg_val_dpo_loss = total_val_dpo_loss / num_val_batches
+        avg_val_sft_loss = total_val_sft_loss / num_val_batches
         avg_val_chosen_rewards = total_val_chosen_rewards / num_val_batches
         avg_val_rejected_rewards = total_val_rejected_rewards / num_val_batches
         print(f"  Average validation loss: {avg_val_loss:.4f}")
@@ -484,10 +534,14 @@ def train(
         epoch_metrics = {
             "epoch": epoch + 1,
             "avg_train_loss": avg_train_loss,
+            "avg_train_dpo_loss": avg_train_dpo_loss,
+            "avg_train_sft_loss": avg_train_sft_loss,
             "avg_train_chosen_rewards": avg_train_chosen_rewards,
             "avg_train_rejected_rewards": avg_train_rejected_rewards,
             "avg_train_rewards_margin": avg_train_chosen_rewards - avg_train_rejected_rewards,
             "avg_val_loss": avg_val_loss,
+            "avg_val_dpo_loss": avg_val_dpo_loss,
+            "avg_val_sft_loss": avg_val_sft_loss,
             "avg_val_chosen_rewards": avg_val_chosen_rewards,
             "avg_val_rejected_rewards": avg_val_rejected_rewards,
             "avg_val_rewards_margin": avg_val_chosen_rewards - avg_val_rejected_rewards,
