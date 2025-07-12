@@ -422,6 +422,8 @@ def train(
                 if (batch_idx + 1) // gradient_accumulation_steps % 10 == 0:
                     batch_metrics = {
                         "batch_loss": actual_loss,
+                        "batch_chosen_rewards": chosen_rewards.mean().item(),
+                        "batch_reject_rewards": rejected_rewards.mean().item(),
                         "batch_rewards_margin": (chosen_rewards - rejected_rewards).mean().item(),
                         "epoch": epoch + 1,
                         "batch": batch_idx + 1,
@@ -482,8 +484,12 @@ def train(
         epoch_metrics = {
             "epoch": epoch + 1,
             "avg_train_loss": avg_train_loss,
+            "avg_train_chosen_rewards": avg_train_chosen_rewards,
+            "avg_train_rejected_rewards": avg_train_rejected_rewards,
             "avg_train_rewards_margin": avg_train_chosen_rewards - avg_train_rejected_rewards,
             "avg_val_loss": avg_val_loss,
+            "avg_val_chosen_rewards": avg_val_chosen_rewards,
+            "avg_val_rejected_rewards": avg_val_rejected_rewards,
             "avg_val_rewards_margin": avg_val_chosen_rewards - avg_val_rejected_rewards,
             "effective_batch_size": effective_batch_size
         }
