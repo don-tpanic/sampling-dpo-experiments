@@ -401,10 +401,12 @@ def train(
         total_train_sft_loss = 0
         total_train_chosen_rewards = 0
         total_train_rejected_rewards = 0
-        num_train_batches = 0
+
         accumulation_loss = 0
         accumulation_dpo_loss = 0
         accumulation_sft_loss = 0
+        accumulation_chosen_rewards = 0
+        accumulation_rejected_rewards = 0
 
         for batch_idx, batch in enumerate(train_dataloader):
             # Compute loss and rewards
@@ -422,40 +424,43 @@ def train(
             )
             
             loss = loss / gradient_accumulation_steps
-            dpo_loss = dpo_loss / gradient_accumulation_steps
-            sft_loss = sft_loss / gradient_accumulation_steps
             loss.backward()
-            accumulation_loss += loss.item()
+
+            accumulation_loss += loss.item() * gradient_accumulation_steps
             accumulation_dpo_loss += dpo_loss.item()
             accumulation_sft_loss += sft_loss.item()
+            accumulation_chosen_rewards += chosen_rewards.mean().item()
+            accumulation_rejected_rewards += rejected_rewards.mean().item()
             
             # Only step optimizer and zero gradients every gradient_accumulation_steps
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 
-                # Log the accumulated loss (multiply back by gradient_accumulation_steps for original scale)
-                actual_loss = accumulation_loss * gradient_accumulation_steps
-                actual_dpo_loss = accumulation_dpo_loss * gradient_accumulation_steps
-                actual_sft_loss = accumulation_sft_loss * gradient_accumulation_steps
+                # Log averaged metrics for this effective batch
+                avg_batch_loss = accumulation_loss / gradient_accumulation_steps
+                avg_batch_dpo_loss = accumulation_dpo_loss / gradient_accumulation_steps
+                avg_batch_sft_loss = accumulation_sft_loss / gradient_accumulation_steps
+                avg_batch_chosen_rewards = accumulation_chosen_rewards / gradient_accumulation_steps
+                avg_batch_rejected_rewards = accumulation_rejected_rewards / gradient_accumulation_steps
                 
-                # Accumulate metrics
-                total_train_loss += actual_loss
-                total_train_dpo_loss += actual_dpo_loss
-                total_train_sft_loss += actual_sft_loss
-                total_train_chosen_rewards += chosen_rewards.mean().item()
-                total_train_rejected_rewards += rejected_rewards.mean().item()
-                num_train_batches += 1
+                # Accumulate metrics for epoch averages
+                total_train_loss += accumulation_loss
+                total_train_dpo_loss += accumulation_dpo_loss
+                total_train_sft_loss += accumulation_sft_loss
+                total_train_chosen_rewards += accumulation_chosen_rewards
+                total_train_rejected_rewards += accumulation_rejected_rewards
                 
                 # Log metrics every 10 accumulated steps
+                # (i.e. 10 effective batches)
                 if (batch_idx + 1) // gradient_accumulation_steps % 10 == 0:
                     batch_metrics = {
-                        "batch_loss": actual_loss,
-                        "batch_dpo_loss": actual_dpo_loss,
-                        "batch_sft_loss": actual_sft_loss,
-                        "batch_chosen_rewards": chosen_rewards.mean().item(),
-                        "batch_reject_rewards": rejected_rewards.mean().item(),
-                        "batch_rewards_margin": (chosen_rewards - rejected_rewards).mean().item(),
+                        "batch_loss": avg_batch_loss,
+                        "batch_dpo_loss": avg_batch_dpo_loss,
+                        "batch_sft_loss": avg_batch_sft_loss,
+                        "batch_chosen_rewards": avg_batch_chosen_rewards,
+                        "batch_reject_rewards": avg_batch_rejected_rewards,
+                        "batch_rewards_margin": avg_batch_chosen_rewards - avg_batch_rejected_rewards,
                         "epoch": epoch + 1,
                         "batch": batch_idx + 1,
                         "accumulated_step": (batch_idx + 1) // gradient_accumulation_steps,
@@ -464,14 +469,17 @@ def train(
                     wandb.log(batch_metrics)
                     print(
                         f"  Step {(batch_idx + 1) // gradient_accumulation_steps}, "\
-                        f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {actual_loss:.4f}"\
-                        f"  DPO Loss: {actual_dpo_loss:.4f}, SFT Loss: {actual_sft_loss:.4f}"
+                        f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {avg_batch_loss:.4f}"\
+                        f"  DPO Loss: {avg_batch_dpo_loss:.4f}, SFT Loss: {avg_batch_sft_loss:.4f}"
                     )
                 
-                # Reset accumulation loss
+                # Reset accumulation loss and rewards
+                # at the end of every effective batch
                 accumulation_loss = 0
                 accumulation_dpo_loss = 0
                 accumulation_sft_loss = 0
+                accumulation_chosen_rewards = 0
+                accumulation_rejected_rewards = 0
         
         # Handle remaining gradients if the last batch doesn't complete a full accumulation cycle
         if len(train_dataloader) % gradient_accumulation_steps != 0:
@@ -480,17 +488,17 @@ def train(
             
             # Log the remaining accumulated loss
             if accumulation_loss > 0:
-                actual_loss = accumulation_loss * gradient_accumulation_steps
-                total_train_loss += actual_loss
+                total_train_loss += accumulation_loss
                 total_train_dpo_loss += accumulation_dpo_loss
                 total_train_sft_loss += accumulation_sft_loss
-                num_train_batches += 1
+                total_train_chosen_rewards += accumulation_chosen_rewards
+                total_train_rejected_rewards += accumulation_rejected_rewards
         
-        avg_train_loss = total_train_loss / max(num_train_batches, 1)
-        avg_train_dpo_loss = total_train_dpo_loss / max(num_train_batches, 1)
-        avg_train_sft_loss = total_train_sft_loss / max(num_train_batches, 1)
-        avg_train_chosen_rewards = total_train_chosen_rewards / max(num_train_batches, 1)
-        avg_train_rejected_rewards = total_train_rejected_rewards / max(num_train_batches, 1)
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        avg_train_dpo_loss = total_train_dpo_loss / len(train_dataloader)
+        avg_train_sft_loss = total_train_sft_loss / len(train_dataloader)
+        avg_train_chosen_rewards = total_train_chosen_rewards / len(train_dataloader)
+        avg_train_rejected_rewards = total_train_rejected_rewards / len(train_dataloader)
         print(f"  Average training loss: {avg_train_loss:.4f}")
         
         # Validation phase
