@@ -446,8 +446,8 @@ def train(
             accumulation_dpo_loss += dpo_loss.item()
             accumulation_sft_loss += sft_loss.item()
             accumulation_dpop_loss += dpop_loss.item()
-            accumulation_chosen_rewards += chosen_rewards.mean().item()
-            accumulation_rejected_rewards += rejected_rewards.mean().item()
+            accumulation_chosen_rewards += chosen_rewards.item()
+            accumulation_rejected_rewards += rejected_rewards.item()
             
             # Only step optimizer and zero gradients every gradient_accumulation_steps
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
@@ -490,7 +490,7 @@ def train(
                     print(
                         f"  Step {(batch_idx + 1) // gradient_accumulation_steps}, "\
                         f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {avg_batch_loss:.4f}"\
-                        f"  DPO Loss: {avg_batch_dpo_loss:.4f}, SFT Loss: {avg_batch_sft_loss:.4f}"\
+                        f"  DPO Loss: {avg_batch_dpo_loss:.4f}, SFT Loss: {avg_batch_sft_loss:.4f},"\
                         f"  DPOP Loss: {avg_batch_dpop_loss:.4f}"
                     )
                 
@@ -555,8 +555,8 @@ def train(
                 total_val_dpo_loss += dpo_loss.item()
                 total_val_sft_loss += sft_loss.item()
                 total_val_dpop_loss += dpop_loss.item()
-                total_val_chosen_rewards += chosen_rewards.mean().item()
-                total_val_rejected_rewards += rejected_rewards.mean().item()
+                total_val_chosen_rewards += chosen_rewards.item()
+                total_val_rejected_rewards += rejected_rewards.item()
                 num_val_batches += 1
                         
         avg_val_loss = total_val_loss / num_val_batches
